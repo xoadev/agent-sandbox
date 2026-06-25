@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    outputs:
+      next-version: ${{ steps.version.outputs.next-version }}
+      next-version-tag: ${{ steps.version.outputs.next-version-tag }}
+      has-changes: ${{ steps.version.outputs.has-changes }}
+      changelog: ${{ steps.version.outputs.changelog }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Compute version & changelog
+        id: version
+        uses: xoadev/convco-version@v1
+
+      - name: Create Draft Release
+        if: steps.version.outputs.has-changes == 'true'
+        uses: softprops/action-gh-release@v2.6.2
+        with:
+          tag_name: ${{ steps.version.outputs.next-version-tag }}
+          name: Release ${{ steps.version.outputs.next-version }}
+          body: ${{ steps.version.outputs.changelog }}
+          draft: true
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release summary
+        run: |
+          echo "Current version: ${{ steps.version.outputs.current-version-tag }}"
+          echo "Next version: ${{ steps.version.outputs.next-version-tag }}"
+          echo "Bump type: ${{ steps.version.outputs.bump-type }}"
+          echo "Has changes: ${{ steps.version.outputs.has-changes }}"
