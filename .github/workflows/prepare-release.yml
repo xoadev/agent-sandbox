@@ -1,0 +1,71 @@
+name: Prepare releases
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      cli: ${{ steps.filter.outputs.cli }}
+      agent: ${{ steps.filter.outputs.agent }}
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: dorny/paths-filter@v4.0.1
+        id: filter
+        with:
+          filters: |
+            cli:
+              - 'agent-sandbox.sh'
+              - 'install.sh'
+            opencode:
+              - 'containers/opencode/**'
+
+  release-cli:
+    needs: changes
+    if: needs.changes.outputs.cli == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+
+      - uses: xoadev/convco-version@v1.0.0
+        id: version
+        with:
+          paths: 'agent-sandbox.sh,install.sh'
+
+      - uses: softprops/action-gh-release@v3.0.1
+        with:
+          tag_name: cli-${{ steps.version.outputs.next-version-tag }}
+          name: Release CLI ${{ steps.version.outputs.next-version }}
+          body: ${{ steps.version.outputs.changelog }}
+          draft: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-opencode:
+    needs: changes
+    if: needs.changes.outputs.opencode == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+
+      - uses: xoadev/convco-version@v1.0.0
+        id: version
+        with:
+          paths: 'containers/opencode'
+
+      - uses: softprops/action-gh-release@v3.0.1
+        with:
+          tag_name: opencode-${{ steps.version.outputs.next-version-tag }}
+          name: Release Opencode ${{ steps.version.outputs.next-version }}
+          body: ${{ steps.version.outputs.changelog }}
+          draft: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -9,21 +9,21 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-GLOBAL_DIR="${GLOBAL_DIR:-${HOME:-$(cd ~ && pwd)}/.agent-sandbox}"
-SANDBOX_MOUNT="/workspace"
+readonly SANDBOX_MOUNT="/workspace"
 
 # Show CLI Help Menu
 show_help() {
-    echo -e "${BLUE}Usage:${NC} agent-sandbox [command|environment]"
+    echo -e "${BLUE}Usage:${NC} agent-sandbox <command>"
     echo ""
     echo -e "${BLUE}Commands:${NC}"
-    echo "  init              Initialize an environment configuration in the current directory (.agent-sandbox/dev.json)"
-    echo "  [environment]     Spin up the specified sandbox environment (e.g. 'dev') and drop into an interactive shell"
+    echo "  init <env>        Initialize an environment configuration in the current directory (.agent-sandbox/[env].env and .agent-sandbox/[env].secret.env)"
+    echo "  run <env>         Spin up the specified sandbox environment (e.g. 'opencode') and drop into an interactive shell"
+    echo "  ps                List running sandbox sessions"
     echo "  help              Show this help screen"
     echo ""
-    echo -e "${BLUE}Example:${NC}"
-    echo "  agent-sandbox init"
-    echo "  agent-sandbox dev"
+    echo -e "${BLUE}Examples:${NC}"
+    echo "  agent-sandbox init opencode"
+    echo "  agent-sandbox run opencode"
 }
 
 # Print an error and exit non-zero
@@ -32,63 +32,67 @@ die() {
     exit 1
 }
 
+urlencode() {
+    local s="$1" i c
+    for ((i=0; i<${#s}; i++)); do
+        c="${s:i:1}"
+        case "$c" in
+            [-_.~a-zA-Z0-9]) printf '%s' "$c" ;;
+            *) printf '%%%02x' "'$c" ;;
+        esac
+    done
+}
+
 # Initialization Command
 cmd_init() {
     local LOCAL_DIR="./.agent-sandbox"
-    if [ -d "$LOCAL_DIR" ]; then
-        die "the folder '$LOCAL_DIR' already exists in this project."
-    fi
+    local ENVIRONMENT="$1"
+    [ -n "$ENVIRONMENT" ] || die "Missing environment name.\nUsage: agent-sandbox init <environment>\nExample: agent-sandbox init opencode"
 
     mkdir -p "$LOCAL_DIR"
-    cat <<'EOF' >"$LOCAL_DIR/dev.json"
-{
-  "image": "xoadev/opencode-sandbox-image:latest",
-  "vault": [
-    {
-      "match": { "host": "api.github.com" },
-      "inject": { "headers": { "Authorization": "Bearer {{secrets.github}}" } }
-    },
-    {
-      "match": { "host": "api.anthropic.com" },
-      "inject": { "headers": { "x-api-key": "{{secrets.anthropic}}" } }
-    }
-  ]
-}
+
+    echo -e "${BLUE}Configuring environment '${ENVIRONMENT}'.${NC}"
+    echo ""
+
+    local VAULT_ADDR VAULT_TOKEN VAULT_VAULT
+
+    read -rp "Vault address [localhost:14321]: " VAULT_ADDR
+    VAULT_ADDR="${VAULT_ADDR:-localhost:14321}"
+
+    read -rsp "Vault token: " VAULT_TOKEN
+    echo
+    [ -n "$VAULT_TOKEN" ] || die "Vault token cannot be empty"
+
+    read -rp "Vault name [default]: " VAULT_VAULT
+    VAULT_VAULT="${VAULT_VAULT:-default}"
+
+    cat >"$LOCAL_DIR/$ENVIRONMENT.env" <<EOF
+AGENT_SANDBOX_IMAGE="agent-sandbox-opencode:latest"
+AGENT_VAULT_ADDR="${VAULT_ADDR}"
+AGENT_VAULT_VAULT="${VAULT_VAULT}"
 EOF
-    echo -e "${GREEN}✔ Environment initialized successfully at '$LOCAL_DIR/dev.json'.${NC}"
-    echo -e "Adjust your workspace rules, then run 'agent-sandbox dev' to start."
+
+    cat >"$LOCAL_DIR/$ENVIRONMENT.secret.env" <<EOF
+AGENT_VAULT_TOKEN="${VAULT_TOKEN}"
+EOF
+
+    echo -e "${GREEN}✔ Environment '$ENVIRONMENT' initialized at '$LOCAL_DIR/$ENVIRONMENT.env'.${NC}"
+    echo -e "Run 'agent-sandbox $ENVIRONMENT' to start."
 }
 
-# Resolve the 'image' field from a JSON config file.
-# Accepts either a registry image name, or a local path to a Dockerfile
-# (prefixed with './' or '/', or ending in 'Dockerfile'). When a Dockerfile is
-# detected the image is built and tagged as 'agent-sandbox-<env>:latest'.
-#
-# Globals read:
-#   ENV_NAME       target environment name (used for the produced tag)
-# Globals set:
-#   RESOLVED_IMAGE the image reference to use in docker-compose
-# Globals used for output only:
-#   BUILT_IMAGE    non-empty when an image was freshly built
-#
-# Args:
-#   $1  raw 'image' value from dev.json
+# Resolve the 'image' field from an environment config file.
+# Registry name → use as-is. Path starting with ./ or /, or ending in Dockerfile → build.
 resolve_image() {
-    local image_value="$1"
-    RESOLVED_IMAGE=""
-    BUILT_IMAGE=""
+    local image_value="$1" env_name="$2"
 
-    # Dockerfile path detection: starts with './' or '/', or ends in 'Dockerfile'
     if [[ $image_value == ./* ]] || [[ $image_value == /* ]] || [[ $image_value == *Dockerfile ]]; then
         local dockerfile_path="${image_value}"
         local context_dir
 
         if [[ -d $dockerfile_path ]]; then
-            # Directory: context is the directory, Dockerfile is implicit
             context_dir="$dockerfile_path"
             dockerfile_path="${dockerfile_path%/}/Dockerfile"
         else
-            # File path: context is its parent directory
             context_dir="$(dirname "$dockerfile_path")"
         fi
 
@@ -96,143 +100,49 @@ resolve_image() {
             die "image points to a Dockerfile but no file found at: $dockerfile_path"
         fi
 
-        BUILT_IMAGE="agent-sandbox-${ENV_NAME}:latest"
+        local built_image="agent-sandbox-${env_name}:latest"
         echo -e "🔨 Building image from ${BLUE}${dockerfile_path}${NC}..."
-        docker build -f "$dockerfile_path" -t "$BUILT_IMAGE" "$context_dir"
-        RESOLVED_IMAGE="$BUILT_IMAGE"
+        docker build -f "$dockerfile_path" -t "$built_image" "$context_dir"
+        printf '%s' "$built_image"
     else
-        RESOLVED_IMAGE="$image_value"
+        printf '%s' "$image_value"
     fi
-}
-
-# Compile Agent Vault configuration by reading dev.json, parsing secrets.env
-# and substituting every "{{secrets.<key>}}" placeholder with the matching
-# secret value. The result is written to $1 as a JSON agent-vault config file.
-#
-# secrets.env is expected to contain simple `key=value` assignments, one per
-# line. Lines starting with '#' or empty lines are ignored. Values may contain
-# any characters except a trailing newline (no quote handling is performed).
-#
-# Args:
-#   $1  output path for vault-config.json
-#   $2  path to dev.json (local environment config)
-#   $3  path to secrets.env (global secrets)
-compile_vault_config() {
-    local out_path="$1"
-    local dev_json="$2"
-    local secrets_env="$3"
-    local content vault_block line secret_key secret_val
-
-    [ -f "$dev_json" ] || die "environment config not found at: $dev_json"
-    [ -f "$secrets_env" ] || die "global secrets file not found at: $secrets_env"
-
-    content="$(cat "$dev_json")"
-
-    # Parse secrets.env line by line and substitute placeholders
-    while IFS= read -r line || [ -n "$line" ]; do
-        # Skip blank lines and comments
-        case "$line" in '' | \#*) continue ;; esac
-        secret_key="${line%%=*}"
-        secret_val="${line#*=}"
-        [ -n "$secret_key" ] || continue
-        content="${content//\{\{secrets.${secret_key}\}\}/${secret_val}}"
-    done <"$secrets_env"
-
-    vault_block="$(extract_vault_array "$content")"
-
-    cat >"$out_path" <<EOF
-{
-  "vaults": {
-    "local-sandbox-vault": {
-      "credentials": {},
-      "rules": [${vault_block}]
-    }
-  }
-}
-EOF
-}
-
-# Extract the inner contents of the top-level "vault" array from a JSON string.
-# Locates `"vault"` followed by the first '[' and walks the bracket depth to
-# capture the array body (without the enclosing brackets).
-#
-# Args:
-#   $1  JSON content as a string
-# Prints: the contents of the vault array (without enclosing brackets),
-#         or an empty string when the "vault" key is absent.
-extract_vault_array() {
-    local json="$1"
-    local len=${#json}
-    local head rest bracket_in_rest vault_idx start depth i ch out=""
-
-    # Locate the position of "vault"
-    head="${json%%\"vault\"*}"
-    [ "$head" = "$json" ] && {
-        printf '%s' "$out"
-        return
-    }
-    vault_idx=${#head}
-    rest="${json:vault_idx}"
-    # First '[' after the "vault" key
-    bracket_in_rest="${rest%%\[*}"
-    [ "$bracket_in_rest" = "$rest" ] && {
-        printf '%s' "$out"
-        return
-    }
-    start=$((vault_idx + ${#bracket_in_rest} + 1))
-    depth=1
-
-    for ((i = start; i < len; i++)); do
-        ch="${json:i:1}"
-        case "$ch" in
-            '[')
-                depth=$((depth + 1))
-                out+="$ch"
-                ;;
-            ']')
-                depth=$((depth - 1))
-                if [ "$depth" -eq 0 ]; then
-                    break
-                fi
-                out+="$ch"
-                ;;
-            *) out+="$ch" ;;
-        esac
-    done
-
-    printf '%s' "$out"
 }
 
 # Launch Sandbox Command
 cmd_start_sandbox() {
+    TMP_DIR=""
+    trap - EXIT
+    [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]] || die "Invalid environment name '$1'. Use only letters, numbers, hyphens, and underscores."
     ENV_NAME="$1"
-    local LOCAL_CFG="./.agent-sandbox/${ENV_NAME}.json"
-    local GLOBAL_SECRETS="$GLOBAL_DIR/secrets.env"
+    local LOCAL_CFG="./.agent-sandbox/${ENV_NAME}.env"
+    local SECRETS="./.agent-sandbox/${ENV_NAME}.secret.env"
 
-    [ -f "$LOCAL_CFG" ] || die "environment configuration not found at: $LOCAL_CFG
-Run 'agent-sandbox init' to generate a default configuration."
-    [ -f "$GLOBAL_SECRETS" ] || die "global secrets file '$GLOBAL_SECRETS' is missing.
-Run the installer or create it manually with your secret assignments."
+    if [ ! -f "$LOCAL_CFG" ]; then
+        echo -e "${BLUE}⚠️  Configuration not found at '$LOCAL_CFG'.${NC}"
+        echo -n "Run 'agent-sandbox init ${ENV_NAME}' now? [Y/n] "
+        read -r reply
+        if [[ $reply =~ ^[Nn] ]]; then
+            die "Run 'agent-sandbox init $ENV_NAME' first."
+        fi
+        cmd_init "$ENV_NAME"
+    fi
+    [ -f "$SECRETS" ] || die "secrets file '$SECRETS' is missing. Re-run 'agent-sandbox init $ENV_NAME' to regenerate it."
 
     echo -e "🚀 Preparing secure sandbox for environment: ${BLUE}${ENV_NAME}${NC}..."
 
-    # 1. Secure temporary directory for dynamic assets
+    # Secure temporary directory for dynamic assets (global so trap outlives the function)
     TMP_DIR="$(mktemp -d -t agent-sandbox-XXXXXXXX)"
     chmod 700 "$TMP_DIR"
 
-    # Generate random key for Agent Vault AES-GCM database in memory
-    VAULT_KEY="$(openssl rand -hex 16)"
+    local SESSION_ID="$(date +%s)-$$"
 
-    # 2. Compile vault configuration
-    compile_vault_config "$TMP_DIR/vault-config.json" "$LOCAL_CFG" "$GLOBAL_SECRETS"
+    source "$LOCAL_CFG"
+    local RAW_IMAGE="${AGENT_SANDBOX_IMAGE:-}"
 
-    # Extract the image field with a pure-bash regex
-    local RAW_IMAGE
-    RAW_IMAGE="$(grep -oE '"image"[[:space:]]*:[[:space:]]*"[^"]*"' "$LOCAL_CFG" | sed -E 's/^.*"([^"]*)"$/\1/')"
-    [ -n "$RAW_IMAGE" ] || RAW_IMAGE="xoadev/opencode-sandbox-image:latest"
+    [ -z "$RAW_IMAGE" ] && die "Image to load not found in environment config"
 
-    resolve_image "$RAW_IMAGE"
-    local IMAGE="$RESOLVED_IMAGE"
+    local IMAGE; IMAGE="$(resolve_image "$RAW_IMAGE" "$ENV_NAME")" || die "Failed to resolve Docker image"
 
     # Allow tests to stop after compilation without invoking Docker
     if [ "${SANDBOX_SKIP_DOCKER:-0}" = "1" ]; then
@@ -242,25 +152,34 @@ Run the installer or create it manually with your secret assignments."
     local CURRENT_DIR
     CURRENT_DIR="$(pwd)"
 
-    # 3. Isolated temporary docker-compose.yml
+    # Load secrets (sourced inside the function, so vars stay local)
+    source "$SECRETS"
+
+    [ -n "${AGENT_VAULT_TOKEN:-}" ] || die "AGENT_VAULT_TOKEN is missing from $SECRETS"
+    [ -n "${AGENT_VAULT_ADDR:-}" ] || die "AGENT_VAULT_ADDR is missing from $LOCAL_CFG"
+    [ -n "${AGENT_VAULT_VAULT:-}" ] || die "AGENT_VAULT_VAULT is missing from $LOCAL_CFG"
+
+    # Strip protocol prefix and port from vault address
+    local VAULT_ADDR_RAW="${AGENT_VAULT_ADDR#*://}"
+    local VAULT_HOST="${VAULT_ADDR_RAW%%:*}"
+    local PROXY_URL="http://$(urlencode "$AGENT_VAULT_TOKEN"):$(urlencode "$AGENT_VAULT_VAULT")@${VAULT_HOST}:14322"
+
+    # Fetch MITM CA from vault API so tools inside the container trust the proxy's TLS
+    local CA_FILE="${TMP_DIR}/mitm-ca.pem"
+    local SSL_MOUNT="" SSL_ENV=""
+    if curl -fsSL "http://${AGENT_VAULT_ADDR}/v1/mitm/ca.pem" -o "$CA_FILE" 2>/dev/null && [ -s "$CA_FILE" ]; then
+        SSL_MOUNT="      - ${CA_FILE}:/root/.agent-vault/mitm-ca.pem"
+        SSL_ENV=$'\n      SSL_CERT_FILE: "/root/.agent-vault/mitm-ca.pem"\n      NODE_EXTRA_CA_CERTS: "/root/.agent-vault/mitm-ca.pem"\n      CURL_CA_BUNDLE: "/root/.agent-vault/mitm-ca.pem"\n      REQUESTS_CA_BUNDLE: "/root/.agent-vault/mitm-ca.pem"\n      GIT_SSL_CAINFO: "/root/.agent-vault/mitm-ca.pem"\n      DENO_CERT: "/root/.agent-vault/mitm-ca.pem"'
+    else
+        echo -e "${BLUE}⚠ Could not fetch MITM CA from vault API. HTTPS via proxy will fail.${NC}"
+    fi
+
+    # Isolated temporary docker-compose.yml
     cat <<EOF >"$TMP_DIR/docker-compose.yml"
 services:
-  agent-vault:
-    image: infisical/agent-vault:latest
-    container_name: sandbox-vault-${ENV_NAME}
-    tty: true
-    stdin_open: true
-    volumes:
-      - ${TMP_DIR}/vault-config.json:/etc/agent-vault/config.json:ro
-    environment:
-      - INFISICAL_ENCRYPTION_KEY=${VAULT_KEY}
-    networks:
-      - secure-net
-    restart: "no"
-
   docker-proxy:
     image: tecnativa/docker-socket-proxy:latest
-    container_name: sandbox-docker-proxy-${ENV_NAME}
+    container_name: sandbox-docker-proxy-${ENV_NAME}-${SESSION_ID}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
@@ -274,50 +193,64 @@ services:
 
   agent-sandbox:
     image: ${IMAGE}
-    container_name: sandbox-execution-${ENV_NAME}
+    container_name: sandbox-execution-${ENV_NAME}-${SESSION_ID}
     runtime: runsc
+    stdin_open: true
+    tty: true
     depends_on:
-      - agent-vault
       - docker-proxy
+    env_file:
+      - ${CURRENT_DIR}/.agent-sandbox/${ENV_NAME}.env
     environment:
-      - http_proxy=http://agent-vault:14322
-      - https_proxy=http://agent-vault:14322
-      - HTTP_PROXY=http://agent-vault:14322
-      - HTTPS_PROXY=http://agent-vault:14322
-      - DOCKER_HOST=tcp://docker-proxy:2375
-      - GITHUB_TOKEN=dummy_github_token
+      HTTP_PROXY: "${PROXY_URL}"
+      HTTPS_PROXY: "${PROXY_URL}"
+      http_proxy: "${PROXY_URL}"
+      https_proxy: "${PROXY_URL}"
+      NO_PROXY: "localhost,127.0.0.1,${VAULT_HOST}"${SSL_ENV}
+    labels:
+      agent-sandbox-session: "${SESSION_ID}"
+      agent-sandbox-env: "${ENV_NAME}"
     volumes:
       - ${CURRENT_DIR}:${SANDBOX_MOUNT}
+${SSL_MOUNT}
     networks:
       - secure-net
     restart: "no"
 
 networks:
   secure-net:
-    name: secure-net-${ENV_NAME}
+    name: secure-net-${ENV_NAME}-${SESSION_ID}
 EOF
 
-    # 4. Cleanup trap
+    # Cleanup trap (always runs on exit, even if compose fails or user Ctrl+C)
     cleanup() {
+        [ -n "${TMP_DIR:-}" ] || return 0
         echo -e "\n${BLUE}🧹 Destroying ephemeral development sandbox...${NC}"
         docker compose -f "$TMP_DIR/docker-compose.yml" down -v --remove-orphans &>/dev/null || true
         rm -rf "$TMP_DIR"
         echo -e "${GREEN}✔ Environment cleared successfully. Host system secured.${NC}"
     }
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
 
-    # 5. Bring up Docker infrastructure
-    echo -e "🧱 Spin up network architecture..."
-    docker compose -f "$TMP_DIR/docker-compose.yml" up -d
+    # Bring up Docker infrastructure (detached)
+    echo -e "🧱 Starting sandbox with runtime: ${BLUE}runsc${NC}..."
+    docker compose -f "$TMP_DIR/docker-compose.yml" up -d || die "docker compose failed to start"
 
     echo -e "${GREEN}✔ Containers started.${NC}"
-    echo -e "🔗 gVisor active. Agent-Vault proxying credentials."
-    echo -e "👉 ${GREEN}Entering Sandbox shell. Type 'exit' to cleanly close and destroy the workspace.${NC}\n"
+    echo -e "🔗 gVisor active. HTTP_PROXY forwarding to Agent Vault."
+    echo -e "👉 ${GREEN}Attaching to sandbox. Type 'exit' to cleanly close and destroy the workspace.${NC}\n"
 
-    # 6. Drop user into the isolated agent container interactively
-    docker exec -it "sandbox-execution-${ENV_NAME}" /bin/bash ||
-        docker exec -it "sandbox-execution-${ENV_NAME}" /bin/sh ||
-        true
+    # Attach to the container's main process (CMD), not a shell
+    docker attach "sandbox-execution-${ENV_NAME}-${SESSION_ID}" || true
+}
+
+# List running sandbox sessions
+cmd_ps() {
+    printf "%-12s %-12s %-20s %s\n" "SESSION" "ENV" "STATUS" "IMAGE"
+    while IFS=$'\t' read -r session env status image; do
+        printf "%-12s %-12s %-20s %s\n" "$session" "$env" "$status" "$image"
+    done < <(docker ps --filter "label=agent-sandbox-session" \
+        --format '{{.Label "agent-sandbox-session"}}\t{{.Label "agent-sandbox-env"}}\t{{.Status}}\t{{.Image}}')
 }
 
 # Main Command Router (only when executed, not when sourced for tests)
@@ -327,10 +260,19 @@ if [[ ${BASH_SOURCE[0]:-$0} == "${0}" ]]; then
             show_help
             ;;
         "init")
-            cmd_init
+            cmd_init "${2:-}"
+            ;;
+        "ps")
+            cmd_ps
+            ;;
+        "run")
+            cmd_start_sandbox "${2:-}"
+            ;;
+        -*)
+            die "Unknown option: $1.\nUsage: agent-sandbox [init <env>|run <env>|ps|help]"
             ;;
         *)
-            cmd_start_sandbox "$1"
+            die "Unknown command '$1'.\nUsage: agent-sandbox [init <env>|run <env>|ps|help]"
             ;;
     esac
 fi

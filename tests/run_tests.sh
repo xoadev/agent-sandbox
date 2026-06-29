@@ -1,26 +1,16 @@
 #!/usr/bin/env bash
 # agent-sandbox test runner (pure bash, no external framework)
-set -u
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SUBJECT="$REPO_DIR/agent-sandbox.sh"
-FIXTURES="$SCRIPT_DIR/fixtures"
 
 PASS=0
 FAIL=0
 FAILURES=()
 
 # ---------- Assertion helpers ----------
-
-assert_equals() {
-    local label="$1" actual="$2" expected="$3"
-    if [ "$actual" = "$expected" ]; then
-        pass "$label"
-    else
-        fail "$label" "expected: <$expected>, got: <$actual>"
-    fi
-}
 
 assert_contains() {
     local label="$1" haystack="$2" needle="$3"
@@ -46,15 +36,6 @@ assert_file_exists() {
         pass "$label"
     else
         fail "$label" "file not found: $path"
-    fi
-}
-
-assert_match() {
-    local label="$1" value="$2" regex="$3"
-    if [[ $value =~ $regex ]]; then
-        pass "$label"
-    else
-        fail "$label" "expected to match regex: <$regex>"
     fi
 }
 
@@ -105,6 +86,7 @@ run_cli() {
 setup() {
     export WORKDIR
     WORKDIR="$(mktemp -d -t agent-sandbox-test-XXXXXX)"
+    trap teardown EXIT
 }
 
 teardown() {
@@ -119,86 +101,35 @@ test_help() {
     out="$(run_cli help)"
     assert_contains "help mentions Usage" "$out" "Usage:"
     assert_contains "help mentions init" "$out" "init"
+    assert_contains "help mentions ps" "$out" "ps"
     assert_contains "help mentions environment" "$out" "environment"
 }
 
-test_init_creates_dev_json() {
-    echo "test_init_creates_dev_json"
-    setup
-    (cd "$WORKDIR" && bash "$SUBJECT" init) >/dev/null 2>&1 || true
-    assert_file_exists "dev.json created" "$WORKDIR/.agent-sandbox/dev.json"
-
-    local content
-    content="$(cat "$WORKDIR/.agent-sandbox/dev.json")"
-    assert_not_contains "no workspace_target field" "$content" "workspace_target"
-    assert_contains "default opencode image" "$content" "xoadev/opencode-sandbox-image:latest"
-    assert_contains "github vault rule" "$content" "api.github.com"
-    assert_contains "anthropic vault rule" "$content" "api.anthropic.com"
-    teardown
+test_init_no_args_shows_error() {
+    echo "test_init_no_args_shows_error"
+    local out
+    out="$(run_cli init 2>&1 || true)"
+    assert_contains "error mentions init" "$out" "init"
+    assert_contains "error mentions <environment>" "$out" "<environment>"
 }
 
-test_vault_compile_substitutes_secrets() {
-    echo "test_vault_compile_substitutes_secrets"
+test_init_creates_dev_env() {
+    echo "test_init_creates_dev_env"
     setup
-    # Source the subject so we can call compile_vault_config directly
-    # shellcheck disable=SC1090
-    (
-        source "$SUBJECT"
-        compile_vault_config "$WORKDIR/vault-config.json" \
-            "$FIXTURES/dev.json" \
-            "$FIXTURES/secrets.env"
-    ) >/dev/null 2>&1 || true
+    # We need to mock the interactive input for 'read'
+    # We provide VAULT_ADDR, VAULT_TOKEN, and VAULT_NAME via stdin
+    printf "localhost:14321\ndummy_token\ndefault_vault\n" | (cd "$WORKDIR" && bash "$SUBJECT" init dev) >/dev/null 2>&1 || true
+    assert_file_exists "dev.env created" "$WORKDIR/.agent-sandbox/dev.env"
+    assert_file_exists "secret.env created" "$WORKDIR/.agent-sandbox/dev.secret.env"
 
-    assert_file_exists "vault-config.json written" "$WORKDIR/vault-config.json"
+    local content secret
+    content="$(cat "$WORKDIR/.agent-sandbox/dev.env")"
+    assert_not_contains "no workspace_target field" "$content" "workspace_arg"
+    assert_contains "default opencode image" "$content" "agent-sandbox-opencode:latest"
 
-    local content
-    content="$(cat "$WORKDIR/vault-config.json")"
-    assert_contains "github secret injected" "$content" "Bearer ghp_REAL_TOKEN"
-    assert_contains "anthropic secret injected" "$content" "sk-ant-REAL_KEY"
-    assert_contains "vault wrapper key present" "$content" "local-sandbox-vault"
-    assert_contains "rules key present" "$content" '"rules"'
-    assert_not_contains "placeholder remains" "$content" "{{secrets."
-
-    # Validate the produced file is well-formed JSON
-    if command -v python3 >/dev/null 2>&1; then
-        if python3 -c "import json,sys; json.load(open('$WORKDIR/vault-config.json'))" >/dev/null 2>&1; then
-            pass "vault-config.json is valid JSON"
-        else
-            fail "vault-config.json is valid JSON" "python3 could not parse the file"
-        fi
-    else
-        pass "vault-config.json is valid JSON (skipped: python3 unavailable)"
-    fi
-    teardown
-}
-
-test_vault_compile_empty_rules() {
-    echo "test_vault_compile_empty_rules"
-    setup
-    mkdir -p "$WORKDIR"
-    cat >"$WORKDIR/dev-empty.json" <<'JSONEOF'
-{ "image": "img:latest", "vault": [] }
-JSONEOF
-    # shellcheck disable=SC1090
-    (
-        source "$SUBJECT"
-        compile_vault_config "$WORKDIR/vault.json" \
-            "$WORKDIR/dev-empty.json" \
-            "$FIXTURES/secrets.env"
-    ) >/dev/null 2>&1 || true
-    assert_file_exists "vault.json written" "$WORKDIR/vault.json"
-    local content
-    content="$(cat "$WORKDIR/vault.json")"
-    assert_contains "empty rules array" "$content" '"rules": []'
-    if command -v python3 >/dev/null 2>&1; then
-        if python3 -c "import json,sys; json.load(open('$WORKDIR/vault.json'))" >/dev/null 2>&1; then
-            pass "empty-rules vault.json is valid JSON"
-        else
-            fail "empty-rules vault.json is valid JSON" "python3 could not parse the file"
-        fi
-    else
-        pass "empty-rules vault.json is valid JSON (skipped: python3 unavailable)"
-    fi
+    secret="$(cat "$WORKDIR/.agent-sandbox/dev.secret.env")"
+    assert_contains "token in secret" "$secret" "dummy_token"
+    assert_not_contains "no proxy in secret" "$secret" "HTTP_PROXY"
     teardown
 }
 
@@ -212,14 +143,11 @@ FROM debian:trixie-slim
 RUN echo hi
 DOCKEREOF
 
-    # dev.json pointing at ./Dockerfile
+    # dev.env pointing at ./Dockerfile
     mkdir -p "$WORKDIR/.agent-sandbox"
-    cat >"$WORKDIR/.agent-sandbox/dev.json" <<'JSONEOF'
-{
-  "image": "./Dockerfile",
-  "vault": []
-}
-JSONEOF
+    cat >"$WORKDIR/.agent-sandbox/dev.env" <<'ENVEOF'
+AGENT_SANDBOX_IMAGE="./Dockerfile"
+ENVEOF
 
     # Stub docker on PATH
     local stub_bin="$WORKDIR/bin"
@@ -228,10 +156,11 @@ JSONEOF
 
     # Run sandbox with docker skipped after resolve, but build is invoked
     # before the skip check, so the stub should record the build call.
-    mkdir -p "$WORKDIR/.global"
-    cp "$FIXTURES/secrets.env" "$WORKDIR/.global/secrets.env"
-    GLOBAL_DIR="$WORKDIR/.global" SANDBOX_SKIP_DOCKER=1 PATH="$stub_bin:$PATH" \
-        bash -c 'cd "$1" && bash "$2" dev' _ "$WORKDIR" "$SUBJECT" \
+    cat >"$WORKDIR/.agent-sandbox/dev.secret.env" <<'SECEOF'
+AGENT_VAULT_TOKEN="test-token"
+SECEOF
+    SANDBOX_SKIP_DOCKER=1 PATH="$stub_bin:$PATH" \
+        bash -c 'cd "$1" && bash "$2" run dev' _ "$WORKDIR" "$SUBJECT" \
         >/dev/null 2>&1 || true
 
     assert_file_exists "docker stub was invoked" "$MOCK_DOCKER_LOG"
@@ -245,28 +174,172 @@ JSONEOF
 test_image_name_not_dockerfile_no_build() {
     echo "test_image_name_not_dockerfile_no_build"
     setup
-    mkdir -p "$WORKDIR/.global" "$WORKDIR/.agent-sandbox"
-    cat >"$WORKDIR/.global/secrets.env" <<'EOF'
-github=ghp_TOKEN
+    mkdir -p "$WORKDIR/.agent-sandbox"
+    cat >"$WORKDIR/.agent-sandbox/dev.env" <<'EOF'
+AGENT_SANDBOX_IMAGE="myregistry/myimage:1.0"
 EOF
-    cat >"$WORKDIR/.agent-sandbox/dev.json" <<'JSONEOF'
-{
-  "image": "myregistry/myimage:1.0",
-  "vault": []
-}
-JSONEOF
+    cat >"$WORKDIR/.agent-sandbox/dev.secret.env" <<'EOF'
+AGENT_VAULT_TOKEN="test-token"
+EOF
 
     local stub_bin="$WORKDIR/bin"
     export MOCK_DOCKER_LOG="$WORKDIR/docker-calls.log"
     make_docker_stub "$stub_bin"
 
-    GLOBAL_DIR="$WORKDIR/.global" SANDBOX_SKIP_DOCKER=1 PATH="$stub_bin:$PATH" \
-        bash -c 'cd "$1" && bash "$2" dev' _ "$WORKDIR" "$SUBJECT" \
+    SANDBOX_SKIP_DOCKER=1 PATH="$stub_bin:$PATH" \
+        bash -c 'cd "$1" && bash "$2" run dev' _ "$WORKDIR" "$SUBJECT" \
         >/dev/null 2>&1 || true
 
     local log
     log="$(cat "$MOCK_DOCKER_LOG" 2>/dev/null || echo '')"
     assert_not_contains "no docker build for plain image name" "$log" "build"
+    teardown
+}
+
+test_image_absolute_path_triggers_build() {
+    echo "test_image_absolute_path_triggers_build"
+    setup
+
+    mkdir -p "$WORKDIR/sub"
+    cat >"$WORKDIR/sub/Dockerfile" <<'DOCKEREOF'
+FROM debian:trixie-slim
+RUN echo hi
+DOCKEREOF
+
+    mkdir -p "$WORKDIR/.agent-sandbox"
+    printf 'AGENT_SANDBOX_IMAGE="%s/sub/Dockerfile"\n' "$WORKDIR" >"$WORKDIR/.agent-sandbox/dev.env"
+
+    local stub_bin="$WORKDIR/bin"
+    export MOCK_DOCKER_LOG="$WORKDIR/docker-calls.log"
+    make_docker_stub "$stub_bin"
+
+    cat >"$WORKDIR/.agent-sandbox/dev.secret.env" <<'SECEOF'
+AGENT_VAULT_TOKEN="test-token"
+SECEOF
+
+    SANDBOX_SKIP_DOCKER=1 PATH="$stub_bin:$PATH" \
+        bash -c 'cd "$1" && bash "$2" run dev' _ "$WORKDIR" "$SUBJECT" \
+        >/dev/null 2>&1 || true
+
+    local log
+    log="$(cat "$MOCK_DOCKER_LOG" 2>/dev/null || true)"
+    assert_contains "absolute path triggers docker build" "$log" "build -f"
+    assert_contains "build tagged agent-sandbox-dev:latest" "$log" "agent-sandbox-dev:latest"
+    teardown
+}
+
+test_start_missing_config_accepts_init() {
+    echo "test_start_missing_config_accepts_init"
+    setup
+    mkdir -p "$WORKDIR/.agent-sandbox"
+    # Answer Y to the auto-init prompt, then provide vault inputs
+    local out
+    out="$(printf "Y\nvault:8200\ntok123\nmyvault\n" | (cd "$WORKDIR" && bash "$SUBJECT" run testenv 2>&1) || true)"
+    assert_contains "config created message" "$out" "testenv"
+    assert_file_exists "env file created" "$WORKDIR/.agent-sandbox/testenv.env"
+    assert_file_exists "secret file created" "$WORKDIR/.agent-sandbox/testenv.secret.env"
+
+    local content secret
+    content="$(cat "$WORKDIR/.agent-sandbox/testenv.env")"
+    assert_contains "uses provided vault address" "$content" "vault:8200"
+    assert_contains "uses provided vault name" "$content" "myvault"
+
+    secret="$(cat "$WORKDIR/.agent-sandbox/testenv.secret.env")"
+    assert_contains "token in secret" "$secret" "tok123"
+    assert_not_contains "no proxy in secret" "$secret" "HTTP_PROXY"
+    teardown
+}
+
+test_image_dockerfile_not_found() {
+    echo "test_image_dockerfile_not_found"
+    setup
+    mkdir -p "$WORKDIR/.agent-sandbox"
+    cat >"$WORKDIR/.agent-sandbox/dev.env" <<'ENVEOF'
+AGENT_SANDBOX_IMAGE="./nonexistent/Dockerfile"
+ENVEOF
+    cat >"$WORKDIR/.agent-sandbox/dev.secret.env" <<'SECEOF'
+AGENT_VAULT_TOKEN="test-token"
+SECEOF
+
+    local stub_bin="$WORKDIR/bin"
+    export MOCK_DOCKER_LOG="$WORKDIR/docker-calls.log"
+    make_docker_stub "$stub_bin"
+
+    local out
+    out="$(SANDBOX_SKIP_DOCKER=1 PATH="$stub_bin:$PATH" \
+        bash -c 'cd "$1" && bash "$2" run dev' _ "$WORKDIR" "$SUBJECT" 2>&1 || true)"
+    assert_contains "error mentions Dockerfile not found" "$out" "Dockerfile"
+    assert_contains "error mentions nonexistent" "$out" "nonexistent"
+
+    local log
+    log="$(cat "$MOCK_DOCKER_LOG" 2>/dev/null || echo '')"
+    assert_not_contains "no docker build attempted" "$log" "build"
+    teardown
+}
+
+test_init_empty_env_name_shows_error() {
+    echo "test_init_empty_env_name_shows_error"
+    local out
+    out="$(echo "" | run_cli init 2>&1 || true)"
+    assert_contains "error mentions environment name" "$out" "environment"
+    assert_contains "error mentions <environment>" "$out" "<environment>"
+}
+
+test_start_missing_config_shows_prompt() {
+    echo "test_start_missing_config_shows_prompt"
+    setup
+    local out
+    out="$(printf "n\n" | (cd "$WORKDIR" && bash "$SUBJECT" run nonexistent 2>&1) || true)"
+    assert_contains "mentions run init first" "$out" "init"
+    assert_not_contains "no config file created" "$(ls "$WORKDIR/.agent-sandbox/" 2>/dev/null || true)" "nonexistent"
+    teardown
+}
+
+test_start_missing_secret_shows_error() {
+    echo "test_start_missing_secret_shows_error"
+    setup
+    mkdir -p "$WORKDIR/.agent-sandbox"
+    cat >"$WORKDIR/.agent-sandbox/test.env" <<'EOF'
+AGENT_SANDBOX_IMAGE="myimage:latest"
+EOF
+    local out
+    out="$(cd "$WORKDIR" && bash "$SUBJECT" run test 2>&1 || true)"
+    assert_contains "error mentions secrets file" "$out" "secrets file"
+    teardown
+}
+
+test_image_dockerfile_directory_triggers_build() {
+    echo "test_image_dockerfile_directory_triggers_build"
+    setup
+
+    # Directory containing a Dockerfile
+    mkdir -p "$WORKDIR/mybuild"
+    cat >"$WORKDIR/mybuild/Dockerfile" <<'DOCKEREOF'
+FROM debian:trixie-slim
+RUN echo hi
+DOCKEREOF
+
+    mkdir -p "$WORKDIR/.agent-sandbox"
+    cat >"$WORKDIR/.agent-sandbox/dev.env" <<'ENVEOF'
+AGENT_SANDBOX_IMAGE="./mybuild"
+ENVEOF
+
+    local stub_bin="$WORKDIR/bin"
+    export MOCK_DOCKER_LOG="$WORKDIR/docker-calls.log"
+    make_docker_stub "$stub_bin"
+
+    cat >"$WORKDIR/.agent-sandbox/dev.secret.env" <<'SECEOF'
+AGENT_VAULT_TOKEN="test-token"
+SECEOF
+
+    SANDBOX_SKIP_DOCKER=1 PATH="$stub_bin:$PATH" \
+        bash -c 'cd "$1" && bash "$2" run dev' _ "$WORKDIR" "$SUBJECT" \
+        >/dev/null 2>&1 || true
+
+    local log
+    log="$(cat "$MOCK_DOCKER_LOG" 2>/dev/null || true)"
+    assert_contains "docker build called for directory Dockerfile" "$log" "build -f"
+    assert_contains "docker build tagged agent-sandbox-dev:latest" "$log" "agent-sandbox-dev:latest"
     teardown
 }
 
@@ -276,10 +349,16 @@ main() {
     echo "Running agent-sandbox tests..."
     echo ""
     test_help
-    test_init_creates_dev_json
-    test_vault_compile_substitutes_secrets
-    test_vault_compile_empty_rules
+    test_init_no_args_shows_error
+    test_init_creates_dev_env
+    test_init_empty_env_name_shows_error
+    test_start_missing_config_shows_prompt
+    test_start_missing_secret_shows_error
+    test_start_missing_config_accepts_init
     test_image_dockerfile_triggers_build
+    test_image_dockerfile_directory_triggers_build
+    test_image_absolute_path_triggers_build
+    test_image_dockerfile_not_found
     test_image_name_not_dockerfile_no_build
 
     echo ""
