@@ -1,5 +1,6 @@
 {
     "plugin": [
         "/opt/ponytail/.opencode/plugins/ponytail.mjs"
-    ]
+    ],
+    "model": "{env:OPENCODE_MODEL}"
 }

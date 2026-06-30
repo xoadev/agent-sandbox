@@ -163,14 +163,31 @@ cmd_start_sandbox() {
     [ -n "${AGENT_VAULT_ADDR:-}" ] || die "AGENT_VAULT_ADDR is missing from $LOCAL_CFG"
     [ -n "${AGENT_VAULT_VAULT:-}" ] || die "AGENT_VAULT_VAULT is missing from $LOCAL_CFG"
 
-    local VAULT_HOST="${AGENT_VAULT_ADDR%%:*}"
+    # Strip protocol prefix and use just the hostname for NO_PROXY
+    local VAULT_ADDR_RAW="${AGENT_VAULT_ADDR#*://}"
+    local VAULT_HOST="${VAULT_ADDR_RAW%%:*}"
+
+    # Proxy URL: vault proxy is on port 14322, vault API is on AGENT_VAULT_ADDR port
     local PROXY_URL
-    PROXY_URL="http://$(urlencode "$AGENT_VAULT_TOKEN"):$(urlencode "$AGENT_VAULT_VAULT")@${AGENT_VAULT_ADDR}"
+    PROXY_URL="http://$(urlencode "$AGENT_VAULT_TOKEN"):$(urlencode "$AGENT_VAULT_VAULT")@${VAULT_HOST}:14322"
 
     # Fetch MITM CA from vault API so tools inside the container trust the proxy's TLS
     local CA_FILE="${TMP_DIR}/mitm-ca.pem"
     local SSL_MOUNT="" SSL_ENV=""
-    if curl -fsSL "http://${AGENT_VAULT_ADDR}/v1/mitm/ca.pem" -o "$CA_FILE" 2>/dev/null && [ -s "$CA_FILE" ]; then
+
+    # Try the port from AGENT_VAULT_ADDR first, then fall back to default API port 14321
+    local CA_PORT CA_URL CA_OK=0
+    for CA_PORT in "${AGENT_VAULT_ADDR##*:}" "14321"; do
+        # Skip if the "port" looks like a hostname (no port in AGENT_VAULT_ADDR)
+        [[ "$CA_PORT" =~ ^[0-9]+$ ]] || continue
+        CA_URL="http://${VAULT_HOST}:${CA_PORT}/v1/mitm/ca.pem"
+        if curl -fsSL "$CA_URL" -o "$CA_FILE" 2>/dev/null && [ -s "$CA_FILE" ]; then
+            CA_OK=1
+            break
+        fi
+    done
+
+    if [ "$CA_OK" = "1" ]; then
         SSL_MOUNT="      - ${CA_FILE}:/root/.agent-vault/mitm-ca.pem"
         SSL_ENV='
       SSL_CERT_FILE: "/root/.agent-vault/mitm-ca.pem"
@@ -180,7 +197,7 @@ cmd_start_sandbox() {
       GIT_SSL_CAINFO: "/root/.agent-vault/mitm-ca.pem"
       DENO_CERT: "/root/.agent-vault/mitm-ca.pem"'
     else
-        echo -e "${BLUE}⚠ Could not fetch MITM CA from vault API. HTTPS via proxy will fail.${NC}"
+        echo -e "${BLUE}⚠ Could not fetch MITM CA from vault API at ${VAULT_HOST}:{${AGENT_VAULT_ADDR##*:},14321}. HTTPS via proxy may fail.${NC}" >&2
     fi
 
     # Isolated temporary docker-compose.yml
