@@ -303,7 +303,7 @@ test_start_missing_secret_shows_error() {
 AGENT_SANDBOX_IMAGE="myimage:latest"
 EOF
     local out
-    out="$(cd "$WORKDIR" && bash "$SUBJECT" run test 2>&1 || true)"
+    out="$(cd "$WORKDIR" && bash "$SUBJECT" run test 2>&1)" || true
     assert_contains "error mentions secrets file" "$out" "secrets file"
     teardown
 }

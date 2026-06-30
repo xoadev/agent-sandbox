@@ -135,8 +135,10 @@ cmd_start_sandbox() {
     TMP_DIR="$(mktemp -d -t agent-sandbox-XXXXXXXX)"
     chmod 700 "$TMP_DIR"
 
-    local SESSION_ID="$(date +%s)-$$"
+    local SESSION_ID
+    SESSION_ID="$(date +%s)-$$"
 
+    # shellcheck source=/dev/null
     source "$LOCAL_CFG"
     local RAW_IMAGE="${AGENT_SANDBOX_IMAGE:-}"
 
@@ -153,23 +155,30 @@ cmd_start_sandbox() {
     CURRENT_DIR="$(pwd)"
 
     # Load secrets (sourced inside the function, so vars stay local)
+    # shellcheck source=/dev/null
     source "$SECRETS"
+    AGENT_VAULT_TOKEN="${AGENT_VAULT_TOKEN//$'\r'}"
 
     [ -n "${AGENT_VAULT_TOKEN:-}" ] || die "AGENT_VAULT_TOKEN is missing from $SECRETS"
     [ -n "${AGENT_VAULT_ADDR:-}" ] || die "AGENT_VAULT_ADDR is missing from $LOCAL_CFG"
     [ -n "${AGENT_VAULT_VAULT:-}" ] || die "AGENT_VAULT_VAULT is missing from $LOCAL_CFG"
 
-    # Strip protocol prefix and port from vault address
-    local VAULT_ADDR_RAW="${AGENT_VAULT_ADDR#*://}"
-    local VAULT_HOST="${VAULT_ADDR_RAW%%:*}"
-    local PROXY_URL="http://$(urlencode "$AGENT_VAULT_TOKEN"):$(urlencode "$AGENT_VAULT_VAULT")@${VAULT_HOST}:14322"
+    local VAULT_HOST="${AGENT_VAULT_ADDR%%:*}"
+    local PROXY_URL
+    PROXY_URL="http://$(urlencode "$AGENT_VAULT_TOKEN"):$(urlencode "$AGENT_VAULT_VAULT")@${AGENT_VAULT_ADDR}"
 
     # Fetch MITM CA from vault API so tools inside the container trust the proxy's TLS
     local CA_FILE="${TMP_DIR}/mitm-ca.pem"
     local SSL_MOUNT="" SSL_ENV=""
     if curl -fsSL "http://${AGENT_VAULT_ADDR}/v1/mitm/ca.pem" -o "$CA_FILE" 2>/dev/null && [ -s "$CA_FILE" ]; then
         SSL_MOUNT="      - ${CA_FILE}:/root/.agent-vault/mitm-ca.pem"
-        SSL_ENV=$'\n      SSL_CERT_FILE: "/root/.agent-vault/mitm-ca.pem"\n      NODE_EXTRA_CA_CERTS: "/root/.agent-vault/mitm-ca.pem"\n      CURL_CA_BUNDLE: "/root/.agent-vault/mitm-ca.pem"\n      REQUESTS_CA_BUNDLE: "/root/.agent-vault/mitm-ca.pem"\n      GIT_SSL_CAINFO: "/root/.agent-vault/mitm-ca.pem"\n      DENO_CERT: "/root/.agent-vault/mitm-ca.pem"'
+        SSL_ENV='
+      SSL_CERT_FILE: "/root/.agent-vault/mitm-ca.pem"
+      NODE_EXTRA_CA_CERTS: "/root/.agent-vault/mitm-ca.pem"
+      CURL_CA_BUNDLE: "/root/.agent-vault/mitm-ca.pem"
+      REQUESTS_CA_BUNDLE: "/root/.agent-vault/mitm-ca.pem"
+      GIT_SSL_CAINFO: "/root/.agent-vault/mitm-ca.pem"
+      DENO_CERT: "/root/.agent-vault/mitm-ca.pem"'
     else
         echo -e "${BLUE}⚠ Could not fetch MITM CA from vault API. HTTPS via proxy will fail.${NC}"
     fi

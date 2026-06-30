@@ -11,6 +11,7 @@
   - `agent-sandbox init <env>`: Initialize a new environment configuration.
   - `bash tests/run_tests.sh`: Run the internal test suite.
 - **Test Directory Usage**: All tests use `mktemp -d` to create temporary directories in system temp location (/tmp) for isolation, and never create persistent folders within the codebase.
+- **Bash Best Practices**: All shell scripts must follow good practices and pass `shellcheck` without errors.
 
 ## 🚀 Monorepo Versioning & CI/CD
 
