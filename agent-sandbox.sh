@@ -101,7 +101,7 @@ resolve_image() {
         fi
 
         local built_image="agent-sandbox-${env_name}:latest"
-        echo -e "🔨 Building image from ${BLUE}${dockerfile_path}${NC}..."
+        echo -e "🔨 Building image from ${BLUE}${dockerfile_path}${NC}..." >&2
         docker build -f "$dockerfile_path" -t "$built_image" "$context_dir"
         printf '%s' "$built_image"
     else
